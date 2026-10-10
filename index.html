@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>ツーリングルート</title>
+
+  <!-- ホーム画面に追加したとき、アプリのように全画面で開くための設定 -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="ツーリング">
+  <meta name="theme-color" content="#14181f">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" href="icons/icon-192.png">
+
+  <!-- 地図ライブラリ Leaflet -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 上部バー -->
+  <header class="topbar">
+    <button class="icon-btn" id="btn-list" aria-label="保存したルート">☰</button>
+    <input id="route-name" class="route-name" placeholder="新しいルート" maxlength="40" autocomplete="off">
+    <button class="icon-btn" id="btn-new" aria-label="新規作成">＋</button>
+  </header>
+
+  <!-- 地図 -->
+  <div id="map"></div>
+
+  <!-- 地図右側の小ボタン -->
+  <div class="map-tools">
+    <button class="tool-btn" id="btn-locate" aria-label="現在地">◎</button>
+    <button class="tool-btn" id="btn-layer" aria-label="地図切替">地</button>
+  </div>
+
+  <!-- 一時メッセージ -->
+  <div id="toast" class="toast" role="status"></div>
+
+  <!-- 下部パネル -->
+  <section class="panel">
+    <div class="stats">
+      <div><span id="stat-dist">--</span><small>距離</small></div>
+      <div><span id="stat-time">--</span><small>目安時間</small></div>
+      <div><span id="stat-points">0</span><small>経由地</small></div>
+      <div id="toll-badge" class="badge" hidden>有料区間あり</div>
+    </div>
+    <label class="switch-row">
+      <input type="checkbox" id="avoid-tolls" checked>
+      <span>有料道路を避ける</span>
+    </label>
+    <div class="actions">
+      <button class="btn" id="btn-undo">戻す</button>
+      <button class="btn" id="btn-reverse">逆順</button>
+      <button class="btn" id="btn-save">保存</button>
+      <button class="btn primary" id="btn-start">出発 ▶</button>
+    </div>
+  </section>
+
+  <!-- シート：保存したルート一覧 -->
+  <div class="sheet" id="sheet-list" hidden>
+    <div class="sheet-body">
+      <div class="sheet-head">
+        <h2>保存したルート</h2>
+        <button class="icon-btn" data-close>✕</button>
+      </div>
+      <ul id="route-list" class="route-list"></ul>
+      <p class="muted" id="route-list-empty">まだ保存したルートはありません。</p>
+    </div>
+  </div>
+
+  <!-- シート：出発（Googleマップへ渡す） -->
+  <div class="sheet" id="sheet-start" hidden>
+    <div class="sheet-body">
+      <div class="sheet-head">
+        <h2>Googleマップで出発</h2>
+        <button class="icon-btn" data-close>✕</button>
+      </div>
+      <div id="start-warning" class="warning" hidden></div>
+      <button class="btn primary wide" id="btn-resume">現在地から続きを案内</button>
+      <a class="btn primary wide resume-link" id="resume-link" target="_blank" rel="noopener" hidden></a>
+      <p class="muted small">今いる場所の近くから、まだ通っていない経由地を順に案内します。休憩後の再開にも。</p>
+      <h3>区間ごとに開く</h3>
+      <ul id="leg-list" class="leg-list"></ul>
+      <button class="btn wide" id="btn-share">このルートを共有（URL）</button>
+      <p class="muted small">Googleマップが開かないときは各区間の「アプリで開く」を試してください。</p>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
