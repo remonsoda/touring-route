@@ -6,10 +6,10 @@
 
 // ===== 設定 =====
 const MAX_WAYPOINTS_PER_LINK = 9;       // Googleマップに1回で渡せる経由地の数（出発地・目的地を除く）
-const ROUTERS = [                        // 無料のルート計算サーバー（OSRM）。1つ目がダメなら2つ目を使う
-  'https://router.project-osrm.org/route/v1/driving/',
-  'https://routing.openstreetmap.de/routed-car/route/v1/driving/',
-];
+// ルート計算：Valhalla（FOSSGIS の無料公開サーバー）。バイク用の設定と有料道路の回避に対応
+const VALHALLA_URL = 'https://valhalla1.openstreetmap.de/route';
+// 予備：OSRM（有料道路の回避はできない）
+const OSRM_URL = 'https://router.project-osrm.org/route/v1/driving/';
 const STORE_ROUTES = 'touring.routes.v1';
 const STORE_DRAFT = 'touring.draft.v1';
 const STORE_VIEW = 'touring.view.v1';
@@ -155,64 +155,96 @@ function changed() {
   renderAll();
   saveDraft();
   clearTimeout(routeTimer);
-  routeTimer = setTimeout(computeRoute, 350);
+  routeTimer = setTimeout(computeRoute, 700);  // 公開サーバーに負担をかけないよう少し待ってから計算
 }
 
 function saveDraft() {
   storage.set(STORE_DRAFT, { id: state.id, name: state.name, points: state.points, avoidTolls: state.avoidTolls, dirty: state.dirty });
 }
 
-// ===== ルート計算（OSRM）=====
-async function fetchRoute(base, points, avoidTolls) {
-  const coords = points.map((p) => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
-  const q = `overview=false&steps=true&geometries=geojson${avoidTolls ? '&exclude=toll' : ''}`;
-  const res = await fetch(`${base}${coords}?${q}`);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.code !== 'Ok') {
-    const err = new Error(data.message || data.code || `HTTP ${res.status}`);
-    err.code = data.code;
-    throw err;
+// ===== ルート計算 =====
+// Valhalla が返す線（polyline6 形式の文字列）を [[lat, lng], ...] に変換
+function decodePolyline6(str) {
+  const coords = [];
+  let index = 0, lat = 0, lng = 0;
+  while (index < str.length) {
+    for (const which of [0, 1]) {
+      let result = 0, shift = 0, b;
+      do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+      const delta = (result & 1) ? ~(result >> 1) : (result >> 1);
+      if (which === 0) lat += delta; else lng += delta;
+    }
+    coords.push([lat / 1e6, lng / 1e6]);
   }
-  return data;
+  return coords;
+}
+
+// 結果は共通の形 { legs: [{coords, distance(m), duration(秒), toll}], snapped: [{lat,lng}] } にそろえる
+async function routeValhalla(points, avoidTolls) {
+  const body = {
+    locations: points.map((p) => ({ lat: +p.lat.toFixed(6), lon: +p.lng.toFixed(6) })),
+    costing: 'motorcycle',
+    costing_options: { motorcycle: avoidTolls ? { exclude_tolls: true } : {} },
+    directions_type: 'none',
+  };
+  // Content-Type を付けないのがポイント（付けるとブラウザの事前確認が入り、失敗しやすい）
+  const res = await fetch(VALHALLA_URL, { method: 'POST', body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.trip) throw new Error(data.error || `HTTP ${res.status}`);
+  const legs = data.trip.legs.map((leg) => ({
+    coords: decodePolyline6(leg.shape),
+    distance: leg.summary.length * 1000,
+    duration: leg.summary.time,
+    toll: !!leg.summary.has_toll,
+  }));
+  // 各区間の線の始点＝道路に吸着した経由地の位置
+  const snapped = legs.map((l) => ({ lat: l.coords[0][0], lng: l.coords[0][1] }));
+  const last = legs[legs.length - 1].coords;
+  snapped.push({ lat: last[last.length - 1][0], lng: last[last.length - 1][1] });
+  return { legs, snapped };
+}
+
+async function routeOsrm(points) {
+  const coords = points.map((p) => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
+  const res = await fetch(`${OSRM_URL}${coords}?overview=false&steps=true&geometries=geojson`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.code !== 'Ok') throw new Error(data.message || data.code || `HTTP ${res.status}`);
+  const legs = data.routes[0].legs.map((leg) => {
+    const c = [];
+    let toll = false;
+    for (const st of leg.steps) {
+      for (const xy of st.geometry.coordinates) c.push([xy[1], xy[0]]);
+      if (st.intersections && st.intersections.some((x) => x.classes && x.classes.includes('toll'))) toll = true;
+    }
+    return { coords: c, distance: leg.distance, duration: leg.duration, toll };
+  });
+  return { legs, snapped: data.waypoints.map((w) => ({ lat: w.location[1], lng: w.location[0] })) };
 }
 
 async function computeRoute() {
   if (state.points.length < 2) { state.legs = []; renderAll(); return; }
   const seq = ++routeRequestSeq;
   const points = state.points.map((p) => ({ ...p }));
-  let data = null, tollFallback = false, lastErr;
+  let result = null, usedFallback = false;
 
-  for (const base of ROUTERS) {
-    try { data = await fetchRoute(base, points, state.avoidTolls); break; }
-    catch (e) {
-      lastErr = e;
-      // 有料回避に対応していないサーバーだった場合は、回避なしで再計算
-      if (state.avoidTolls && /exclude|InvalidValue|InvalidQuery/i.test(`${e.code} ${e.message}`)) {
-        try { data = await fetchRoute(base, points, false); tollFallback = true; break; } catch (e2) { lastErr = e2; }
-      }
-    }
+  try {
+    result = await routeValhalla(points, state.avoidTolls);
+  } catch (e) {
+    console.warn('Valhalla失敗', e);
+    if (seq !== routeRequestSeq) return;
+    try { result = await routeOsrm(points); usedFallback = true; }
+    catch (e2) { console.warn('OSRM失敗', e2); }
   }
   if (seq !== routeRequestSeq) return;  // 計算中に別の変更があった
-  if (!data) { toast('ルートを計算できませんでした。通信状況を確認してください'); console.warn(lastErr); return; }
-  if (tollFallback) toast('有料道路の回避に失敗したため、回避なしで計算しました', 3500);
+  if (!result) { toast('ルートを計算できませんでした。少し待ってから経由地を動かしてみてください', 3500); return; }
+  if (usedFallback && state.avoidTolls) toast('予備のサーバーで計算しました（有料道路の回避は効いていません）', 3500);
 
-  const route = data.routes[0];
-  state.legs = route.legs.map((leg) => {
-    const coords = [];
-    let toll = false;
-    for (const st of leg.steps) {
-      for (const c of st.geometry.coordinates) coords.push([c[1], c[0]]);
-      if (st.intersections && st.intersections.some((x) => x.classes && x.classes.includes('toll'))) toll = true;
-    }
-    return { coords, distance: leg.distance, duration: leg.duration, toll };
-  });
-
+  state.legs = result.legs;
   // 経由地を道路の上に吸着（Googleマップに渡したときのズレを減らす）
-  data.waypoints.forEach((w, i) => {
+  result.snapped.forEach((s, i) => {
     if (!state.points[i]) return;
-    const snapped = { lat: w.location[1], lng: w.location[0] };
-    const d = dist(state.points[i], snapped);
-    if (d > 3 && d < 500) state.points[i] = snapped;
+    const d = dist(state.points[i], s);
+    if (d > 3 && d < 500) state.points[i] = s;
   });
   saveDraft();
   renderAll();
