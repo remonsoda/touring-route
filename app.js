@@ -29,12 +29,20 @@ const state = {
   name: '',
   points: [],          // [{lat, lng}] 0番目=出発地、最後=目的地
   avoidTolls: true,
+  selected: null,      // 選択中の経由地の番号（なし＝null）
+  mainRoad: true,      // 大通りを優先（タップした経由地を県道クラス以上に吸着）
   legs: [],            // ルート計算結果：経由地間ごとの {coords, distance, duration, toll}
   history: [],         // 「戻す」用
   dirty: false,        // 保存後に変更があるか
 };
 let routeRequestSeq = 0;
 let routeTimer = null;
+let suppressClickUntil = 0;
+// 経由地バッジの表示モード（スクショ用に小さく・隠すことができる）
+const MARKER_MODES = ['full', 'small', 'ends'];
+const MARKER_MODE_LABEL = { full: '経由地：通常表示', small: '経由地：小さく表示', ends: '経由地：出発地と目的地だけ' };
+let markerMode = 'full';
+try { markerMode = localStorage.getItem('touring.markerMode') || 'full'; } catch { /* 無視 */ }
 
 // ===== 小道具 =====
 const $ = (sel) => document.querySelector(sel);
@@ -75,6 +83,11 @@ if ('ResizeObserver' in window) {
   new ResizeObserver(() => map.invalidateSize({ pan: false })).observe(document.getElementById('map'));
 }
 window.addEventListener('load', () => map.invalidateSize({ pan: false }));
+// なぞるボタンを下のパネルのすぐ上に置く
+const panelEl = document.querySelector('.panel');
+const placeSketchBtn = () => document.documentElement.style.setProperty('--panel-h', panelEl.offsetHeight + 'px');
+if ('ResizeObserver' in window) new ResizeObserver(placeSketchBtn).observe(panelEl);
+placeSketchBtn();
 map.on('moveend', () => storage.set(STORE_VIEW, { center: [map.getCenter().lat, map.getCenter().lng], zoom: map.getZoom() }));
 
 const routeGroup = L.layerGroup().addTo(map);   // ルートの線
@@ -82,38 +95,64 @@ const markerGroup = L.layerGroup().addTo(map);  // 経由地マーカー
 let meMarker = null;
 
 // 地図をタップ → 経由地を末尾に追加
+// （経由地を選択中なら、まず選択を解除するだけ。うっかり追加を防ぐ）
 map.on('click', (e) => {
+  if (Date.now() < suppressClickUntil) return;   // なぞり終わり直後のクリックは無視
+  if (state.selected !== null) { state.selected = null; map.closePopup(); renderMarkers(); return; }
   pushHistory();
   state.points.push({ lat: e.latlng.lat, lng: e.latlng.lng });
   changed();
 });
 
 // ===== 描画 =====
+// 経由地は「タップで選択 → 選択中のものだけドラッグで動かせる」。
+// 地図をずらそうとして経由地に触れても、勝手に動かないようにするため。
 function renderMarkers() {
   markerGroup.clearLayers();
   const n = state.points.length;
+  let lastShownPx = null;
   state.points.forEach((p, i) => {
-    const cls = i === 0 ? 'start' : (i === n - 1 && n > 1 ? 'goal' : '');
-    const label = i === 0 ? 'S' : (i === n - 1 && n > 1 ? 'G' : String(i));
-    const icon = L.divIcon({ className: '', html: `<div class="wp ${cls}">${label}</div>`, iconSize: [30, 30], iconAnchor: [15, 15] });
-    const m = L.marker([p.lat, p.lng], { icon, draggable: true, autoPan: true }).addTo(markerGroup);
-    m.on('dragstart', () => pushHistory());
-    m.on('dragend', () => {
-      const pos = m.getLatLng();
-      state.points[i] = { lat: pos.lat, lng: pos.lng };
-      changed();
+    const selected = state.selected === i;
+    const isEnd = i === 0 || (i === n - 1 && n > 1);
+    // 表示モード：full＝通常（込み合う所だけ小さく）／small＝全部小さな点／ends＝出発地と目的地だけ
+    if (markerMode === 'ends' && !isEnd && !selected) return;
+    const px = map.latLngToContainerPoint([p.lat, p.lng]);
+    const crowded = lastShownPx && px.distanceTo(lastShownPx) < 36;
+    const small = !selected && (markerMode === 'small' || (crowded && !isEnd));
+    lastShownPx = px;
+    const cls = (i === 0 ? 'start' : (i === n - 1 && n > 1 ? 'goal' : '')) + (selected ? ' selected' : '') + (small ? ' small' : '');
+    const label = small ? '' : (i === 0 ? 'S' : (i === n - 1 && n > 1 ? 'G' : String(i)));
+    const size = selected ? 40 : (small ? (isEnd ? 16 : 12) : 30);
+    const icon = L.divIcon({ className: '', html: `<div class="wp ${cls}">${label}</div>`, iconSize: [size, size], iconAnchor: [size / 2, size / 2] });
+    const m = L.marker([p.lat, p.lng], { icon, draggable: selected, autoPan: true, zIndexOffset: selected ? 1000 : 0 }).addTo(markerGroup);
+    if (selected) {
+      m.on('dragstart', () => { pushHistory(); map.closePopup(); });
+      m.on('dragend', () => {
+        const pos = m.getLatLng();
+        state.points[i] = { lat: pos.lat, lng: pos.lng, exact: true };
+        changed();
+      });
+    }
+    m.on('click', (e) => {
+      L.DomEvent.stopPropagation(e);
+      if (state.selected !== i) { state.selected = i; renderMarkers(); toast('選択中：ドラッグで移動できます'); }
+      openMarkerPopup(i);
     });
-    const box = document.createElement('div');
-    const title = document.createElement('div');
-    title.textContent = i === 0 ? '出発地' : (i === n - 1 && n > 1 ? '目的地' : `経由地 ${i}`);
-    title.style.cssText = 'font-weight:700;margin-bottom:8px;color:#111';
-    const del = document.createElement('button');
-    del.className = 'popup-btn';
-    del.textContent = '削除';
-    del.onclick = () => { pushHistory(); state.points.splice(i, 1); map.closePopup(); changed(); };
-    box.append(title, del);
-    m.bindPopup(box);
   });
+}
+
+function openMarkerPopup(i) {
+  const n = state.points.length, p = state.points[i];
+  const box = document.createElement('div');
+  const title = document.createElement('div');
+  title.textContent = i === 0 ? '出発地' : (i === n - 1 && n > 1 ? '目的地' : `経由地 ${i}`);
+  title.style.cssText = 'font-weight:700;margin-bottom:8px;color:#111';
+  const del = document.createElement('button');
+  del.className = 'popup-btn';
+  del.textContent = '削除';
+  del.onclick = () => { pushHistory(); state.points.splice(i, 1); state.selected = null; map.closePopup(); changed(); };
+  box.append(title, del);
+  L.popup({ offset: [0, -16], autoPan: false }).setLatLng([p.lat, p.lng]).setContent(box).openOn(map);
 }
 
 function renderRoute() {
@@ -125,6 +164,7 @@ function renderRoute() {
     // 太い透明の線：タップしやすくするため。線をタップするとその区間に経由地を挿入
     const hit = L.polyline(leg.coords, { color: '#000', weight: 28, opacity: 0, bubblingMouseEvents: false }).addTo(routeGroup);
     hit.on('click', (e) => {
+      if (Date.now() < suppressClickUntil) return;
       pushHistory();
       state.points.splice(i + 1, 0, { lat: e.latlng.lat, lng: e.latlng.lng });
       changed();
@@ -143,6 +183,7 @@ function renderStats() {
   $('#btn-start').disabled = state.points.length < 2;
   $('#btn-undo').disabled = state.history.length === 0;
   $('#avoid-tolls').checked = state.avoidTolls;
+  $('#main-road').checked = state.mainRoad;
   if (document.activeElement !== $('#route-name')) $('#route-name').value = state.name;
 }
 
@@ -156,6 +197,7 @@ function pushHistory() {
 
 function changed() {
   state.dirty = true;
+  if (state.selected !== null && state.selected >= state.points.length) state.selected = null;
   // 経由地の数が変わったら古い線はずれるので一旦消す
   if (state.legs.length !== Math.max(0, state.points.length - 1)) state.legs = [];
   renderAll();
@@ -186,9 +228,20 @@ function decodePolyline6(str) {
 }
 
 // 結果は共通の形 { legs: [{coords, distance(m), duration(秒), toll}], snapped: [{lat,lng}] } にそろえる
-async function routeValhalla(points, avoidTolls) {
+// opts.mainRoad: 経由地を県道クラス以上の道に吸着させる
+// opts.noUturn : 経由地でのUターンを禁止（わき道に入って戻ってくる「ぐるぐる」を防ぐ）
+async function routeValhalla(points, avoidTolls, opts = {}) {
+  // 地図を広く表示しているほど、タップ位置はおおざっぱなので吸着の範囲を広げる
+  const metersPerPixel = 40075016 * Math.cos(map.getCenter().lat * Math.PI / 180) / Math.pow(2, map.getZoom() + 8);
+  const radius = Math.round(Math.min(800, Math.max(60, metersPerPixel * 30)));
   const body = {
-    locations: points.map((p) => ({ lat: +p.lat.toFixed(6), lon: +p.lng.toFixed(6) })),
+    locations: points.map((p, i) => {
+      const loc = { lat: +p.lat.toFixed(6), lon: +p.lng.toFixed(6) };
+      // ドラッグで細かく置いた経由地（exact）は、狙った道をそのまま使う
+      if (opts.mainRoad && !p.exact) { loc.radius = radius; loc.search_filter = { min_road_class: 'tertiary' }; }
+      if (opts.noUturn && i > 0 && i < points.length - 1) loc.type = 'break_through';
+      return loc;
+    }),
     costing: 'motorcycle',
     costing_options: { motorcycle: avoidTolls ? { exclude_tolls: true } : {} },
     directions_type: 'none',
@@ -207,6 +260,21 @@ async function routeValhalla(points, avoidTolls) {
   const snapped = legs.map((l) => ({ lat: l.coords[0][0], lng: l.coords[0][1] }));
   const last = legs[legs.length - 1].coords;
   snapped.push({ lat: last[last.length - 1][0], lng: last[last.length - 1][1] });
+  return { legs, snapped };
+}
+
+// 公開サーバーは1回に送れる地点数に上限があるため、多いときは20地点ずつに分けて順番に計算してつなぐ
+const MAX_LOCATIONS_PER_REQUEST = 20;
+async function routeValhallaChunked(points, avoidTolls, opts, seq) {
+  if (points.length <= MAX_LOCATIONS_PER_REQUEST) return routeValhalla(points, avoidTolls, opts);
+  const legs = [], snapped = [];
+  for (let s = 0; s < points.length - 1; s += MAX_LOCATIONS_PER_REQUEST - 1) {
+    if (seq !== routeRequestSeq) throw new Error('canceled');
+    if (s > 0) await new Promise((r) => setTimeout(r, 1100));  // 1秒に1回まで
+    const part = await routeValhalla(points.slice(s, s + MAX_LOCATIONS_PER_REQUEST), avoidTolls, opts);
+    legs.push(...part.legs);
+    snapped.push(...(s === 0 ? part.snapped : part.snapped.slice(1)));
+  }
   return { legs, snapped };
 }
 
@@ -234,9 +302,16 @@ async function computeRoute() {
   let result = null, usedFallback = false;
 
   try {
-    result = await routeValhalla(points, state.avoidTolls);
+    result = await routeValhallaChunked(points, state.avoidTolls, { mainRoad: state.mainRoad, noUturn: true }, seq);
   } catch (e) {
     console.warn('Valhalla失敗', e);
+    // 行き止まりの展望台など、Uターン禁止では行けない場所がある場合は条件をゆるめて再計算
+    if (seq !== routeRequestSeq) return;
+    await new Promise((r) => setTimeout(r, 1100));
+    try { result = await routeValhallaChunked(points, state.avoidTolls, { mainRoad: false, noUturn: false }, seq); }
+    catch (e2) { console.warn('Valhalla再計算も失敗', e2); }
+  }
+  if (!result) {
     if (seq !== routeRequestSeq) return;
     try { result = await routeOsrm(points); usedFallback = true; }
     catch (e2) { console.warn('OSRM失敗', e2); }
@@ -250,7 +325,7 @@ async function computeRoute() {
   result.snapped.forEach((s, i) => {
     if (!state.points[i]) return;
     const d = dist(state.points[i], s);
-    if (d > 3 && d < 500) state.points[i] = s;
+    if (d > 3 && d < 1000) state.points[i] = { ...s, ...(state.points[i].exact ? { exact: true } : {}) };
   });
   saveDraft();
   renderAll();
@@ -293,6 +368,7 @@ function openRoute(r) {
   state.avoidTolls = r.avoidTolls !== false;
   state.legs = [];
   state.history = [];
+  state.selected = null;
   state.dirty = false;
   renderAll();
   saveDraft();
@@ -465,16 +541,294 @@ document.querySelectorAll('.sheet').forEach((s) => {
   s.addEventListener('click', (e) => { if (e.target === s || e.target.closest('[data-close]')) closeSheets(); });
 });
 
+// ===== なぞってルートを作る =====
+// iPhone：「なぞる」ボタンを押している間、もう1本の指で地図をなぞる（短くタップすると固定ON/OFF）
+// PC   ：Ctrl（または Shift）を押しながらドラッグ
+const sketch = {
+  held: false,        // ボタンを押している間
+  latched: false,     // 短くタップして固定ONにした状態
+  ctrl: false,        // PCで Ctrl/Shift を押している間
+  drawing: false,
+  touchId: null,
+  pts: [],            // なぞった点 [{lat,lng}]
+  lastPx: null,
+  line: null,
+};
+const sketchBtn = $('#btn-sketch');
+function sketchActive() { return sketch.held || sketch.latched || sketch.ctrl; }
+function updateSketchMode() {
+  const on = sketchActive();
+  sketchBtn.classList.toggle('on', on);
+  sketchBtn.classList.toggle('latched', sketch.latched);
+  document.getElementById('map').classList.toggle('drawing', on);
+  // なぞっている間は地図を動かさない（ボタンを離せば元通り）
+  for (const h of [map.dragging, map.touchZoom, map.doubleClickZoom, map.boxZoom]) on ? h.disable() : h.enable();
+}
+
+// ボタン：押している間だけ有効。250ms未満の短いタップで固定ON/OFF
+let sketchPressAt = 0, sketchDrewDuringPress = false;
+sketchBtn.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  sketchPressAt = Date.now(); sketchDrewDuringPress = false;
+  sketch.held = true; updateSketchMode();
+});
+const releaseSketchBtn = (e) => {
+  if (!sketch.held) return;
+  e && e.preventDefault();
+  sketch.held = false;
+  if (Date.now() - sketchPressAt < 250 && !sketchDrewDuringPress) {
+    sketch.latched = !sketch.latched;
+    toast(sketch.latched ? 'なぞるモードON（もう一度タップでOFF）' : 'なぞるモードOFF');
+  }
+  if (sketch.drawing && !sketch.latched) finishStroke();
+  updateSketchMode();
+};
+sketchBtn.addEventListener('pointerup', releaseSketchBtn);
+sketchBtn.addEventListener('pointercancel', releaseSketchBtn);
+sketchBtn.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// PC：Ctrl / Shift
+window.addEventListener('keydown', (e) => { if ((e.key === 'Control' || e.key === 'Shift') && !sketch.ctrl && document.activeElement.tagName !== 'INPUT') { sketch.ctrl = true; updateSketchMode(); } });
+window.addEventListener('keyup', (e) => { if (e.key === 'Control' || e.key === 'Shift') { sketch.ctrl = false; if (sketch.drawing) finishStroke(); updateSketchMode(); } });
+window.addEventListener('blur', () => { sketch.ctrl = false; updateSketchMode(); });
+
+function strokeStart(clientPt) {
+  sketch.drawing = true; sketchDrewDuringPress = true;
+  sketch.pts = []; sketch.lastPx = null;
+  if (sketch.line) map.removeLayer(sketch.line);
+  sketch.line = L.polyline([], { color: '#2f8cff', weight: 5, opacity: 0.9, dashArray: '8 8', interactive: false }).addTo(map);
+  strokeMove(clientPt);
+}
+function strokeMove(clientPt) {
+  const cp = map.mouseEventToContainerPoint(clientPt);
+  if (sketch.lastPx && cp.distanceTo(sketch.lastPx) < 5) return;  // 細かすぎる点は捨てる
+  sketch.lastPx = cp;
+  const ll = map.containerPointToLatLng(cp);
+  sketch.pts.push({ lat: ll.lat, lng: ll.lng });
+  sketch.line.addLatLng(ll);
+}
+
+const mapEl = document.getElementById('map');
+// タッチ（iPhone）。なぞるボタンを押している指とは別の指を追いかける
+mapEl.addEventListener('touchstart', (e) => {
+  if (!sketchActive() || sketch.drawing) return;
+  const t = [...e.changedTouches].find((t) => mapEl.contains(t.target));
+  if (!t) return;
+  e.preventDefault(); e.stopPropagation();
+  sketch.touchId = t.identifier;
+  strokeStart(t);
+}, { passive: false, capture: true });
+mapEl.addEventListener('touchmove', (e) => {
+  if (!sketch.drawing) return;
+  const t = [...e.changedTouches].find((t) => t.identifier === sketch.touchId);
+  if (!t) return;
+  e.preventDefault(); e.stopPropagation();
+  strokeMove(t);
+}, { passive: false, capture: true });
+const touchEnd = (e) => {
+  if (!sketch.drawing) return;
+  if (![...e.changedTouches].some((t) => t.identifier === sketch.touchId)) return;
+  e.preventDefault(); e.stopPropagation();
+  finishStroke();
+};
+mapEl.addEventListener('touchend', touchEnd, { passive: false, capture: true });
+mapEl.addEventListener('touchcancel', touchEnd, { passive: false, capture: true });
+
+// マウス（PC）
+mapEl.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  if (!(sketchActive() || e.ctrlKey || e.shiftKey)) return;
+  e.preventDefault(); e.stopPropagation();
+  strokeStart(e);
+}, true);
+window.addEventListener('mousemove', (e) => { if (sketch.drawing && sketch.touchId === null) strokeMove(e); });
+window.addEventListener('mouseup', () => { if (sketch.drawing && sketch.touchId === null) finishStroke(); });
+
+// なぞった線の長さ（メートル）と、線の途中の点を取り出す道具
+function pathLength(pts) { let d = 0; for (let i = 1; i < pts.length; i++) d += dist(pts[i - 1], pts[i]); return d; }
+function pointAlong(pts, target) {
+  let acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const seg = dist(pts[i - 1], pts[i]);
+    if (acc + seg >= target) {
+      const t = seg ? (target - acc) / seg : 0;
+      return { lat: pts[i - 1].lat + (pts[i].lat - pts[i - 1].lat) * t, lng: pts[i - 1].lng + (pts[i].lng - pts[i - 1].lng) * t };
+    }
+    acc += seg;
+  }
+  return { ...pts[pts.length - 1] };
+}
+
+function finishStroke() {
+  sketch.drawing = false;
+  sketch.touchId = null;
+  suppressClickUntil = Date.now() + 400;
+  const pts = sketch.pts;
+  setTimeout(() => { if (sketch.line && !sketch.drawing) { map.removeLayer(sketch.line); sketch.line = null; } }, 1500);
+  const total = pts.length > 1 ? pathLength(pts) : 0;
+  const mpp = 40075016 * Math.cos(map.getCenter().lat * Math.PI / 180) / Math.pow(2, map.getZoom() + 8);
+  if (total < mpp * 30) return;  // 短すぎる（ただのタップ）
+
+  // なぞった線を等間隔の点（アンカー）に置き換える。間隔は画面上でおよそ90px、最低500m
+  const spacing = Math.max(500, mpp * 90);
+  const n = Math.min(14, Math.max(1, Math.round(total / spacing)));
+  const anchors = [];
+  for (let k = 0; k <= n; k++) anchors.push(pointAlong(pts, (total * k) / n));
+
+  pushHistory();
+  const P = state.points;
+  const nearIdx = (q) => {  // 画面上で近い既存の経由地（60px以内）
+    let best = -1, bestPx = 60;
+    P.forEach((p, i) => { const d = map.latLngToContainerPoint([p.lat, p.lng]).distanceTo(map.latLngToContainerPoint([q.lat, q.lng])); if (d < bestPx) { bestPx = d; best = i; } });
+    return best;
+  };
+  if (P.length === 0) {
+    state.points = anchors;                                   // ルートが空 → なぞった線がそのままルート
+  } else {
+    let a = nearIdx(anchors[0]), b = nearIdx(anchors[anchors.length - 1]);
+    if (a === -1 && b === -1) {
+      // どの経由地からも離れた場所から描いた → 目的地の先につなげる
+      state.points = P.concat(anchors);
+    } else if (a !== -1 && b !== -1 && a !== b) {
+      // 2つの経由地の間をなぞった → その間を描いた線で置き換える
+      let mid = anchors.slice(1, -1);
+      if (a > b) { [a, b] = [b, a]; mid = mid.reverse(); }
+      state.points = P.slice(0, a + 1).concat(mid, P.slice(b));
+    } else if (a !== -1 && b === -1) {
+      // 経由地から描き始めて、外へ伸ばした
+      if (a === P.length - 1) state.points = P.concat(anchors.slice(1));            // 目的地から先へ延長
+      else state.points = P.slice(0, a + 1).concat(anchors.slice(1), P.slice(a + 1)); // 途中から寄り道を足す
+    } else {
+      // 外から描いて経由地で終わった
+      if (b === 0) state.points = anchors.slice(0, -1).concat(P);                   // 出発地の手前に追加
+      else state.points = P.slice(0, b).concat(anchors.slice(0, -1), P.slice(b));
+    }
+  }
+  state.selected = null;
+  state.legs = [];
+  changed();
+  toast(`なぞった線から経由地を${anchors.length}個つくりました`);
+}
+
+// ===== ルートの線をドラッグして経路を変える =====
+// PC：線をそのままドラッグ／iPhone：線を少し長押し（0.35秒）してからドラッグ
+// （iPhoneで長押しにしているのは、地図をずらそうとして線に触れたときに勝手に変わらないようにするため）
+const lineDrag = { active: false, leg: -1, touchId: null, timer: null, startPx: null, preview: null, ghost: null, pos: null };
+
+// 画面上の点 px から一番近いルートの区間を探す → { leg, d(px) }
+function nearestLeg(px) {
+  let best = { leg: -1, d: Infinity };
+  state.legs.forEach((leg, i) => {
+    let prev = null;
+    for (const c of leg.coords) {
+      const cp = map.latLngToContainerPoint(c);
+      if (prev) {
+        const d = L.LineUtil.pointToSegmentDistance(px, prev, cp);
+        if (d < best.d) best = { leg: i, d };
+      }
+      prev = cp;
+    }
+  });
+  return best;
+}
+function nearMarker(px, r) {
+  return state.points.some((p) => map.latLngToContainerPoint([p.lat, p.lng]).distanceTo(px) < r);
+}
+function lineDragBegin(leg, clientPt) {
+  lineDrag.active = true; lineDrag.leg = leg;
+  map.dragging.disable();
+  const a = state.points[leg], b = state.points[leg + 1];
+  const ll = map.mouseEventToLatLng(clientPt);
+  lineDrag.pos = ll;
+  lineDrag.preview = L.polyline([[a.lat, a.lng], ll, [b.lat, b.lng]], { color: '#ff7a1a', weight: 4, dashArray: '8 8', interactive: false }).addTo(map);
+  lineDrag.ghost = L.circleMarker(ll, { radius: 12, color: '#fff', weight: 3, fillColor: '#ff7a1a', fillOpacity: 1, interactive: false }).addTo(map);
+  document.getElementById('map').classList.add('line-dragging');
+}
+function lineDragMove(clientPt) {
+  const ll = map.mouseEventToLatLng(clientPt);
+  lineDrag.pos = ll;
+  const a = state.points[lineDrag.leg], b = state.points[lineDrag.leg + 1];
+  lineDrag.preview.setLatLngs([[a.lat, a.lng], ll, [b.lat, b.lng]]);
+  lineDrag.ghost.setLatLng(ll);
+}
+function lineDragEnd(commit) {
+  clearTimeout(lineDrag.timer); lineDrag.timer = null;
+  if (!lineDrag.active) { lineDrag.touchId = null; return; }
+  lineDrag.active = false;
+  map.removeLayer(lineDrag.preview); map.removeLayer(lineDrag.ghost);
+  document.getElementById('map').classList.remove('line-dragging');
+  if (!sketchActive()) map.dragging.enable();
+  suppressClickUntil = Date.now() + 400;
+  lineDrag.touchId = null;
+  if (!commit) return;
+  pushHistory();
+  // ドラッグで置いた点は「狙った場所」なので吸着しない（exact）
+  state.points.splice(lineDrag.leg + 1, 0, { lat: lineDrag.pos.lat, lng: lineDrag.pos.lng, exact: true });
+  state.selected = null;
+  changed();
+}
+
+// マウス：線の上で押したら、すぐドラッグ開始
+mapEl.addEventListener('mousedown', (e) => {
+  if (e.button !== 0 || sketchActive() || e.ctrlKey || e.shiftKey || !state.legs.length) return;
+  const px = map.mouseEventToContainerPoint(e);
+  if (nearMarker(px, 20)) return;
+  const n = nearestLeg(px);
+  if (n.leg < 0 || n.d > 12) return;
+  e.preventDefault(); e.stopPropagation();
+  lineDragBegin(n.leg, e);
+}, true);
+window.addEventListener('mousemove', (e) => { if (lineDrag.active && lineDrag.touchId === null) lineDragMove(e); });
+window.addEventListener('mouseup', (e) => {
+  if (!lineDrag.active || lineDrag.touchId !== null) return;
+  // ほとんど動かしていなければ、ただのクリック扱い（その場所に経由地を挿入）
+  lineDragEnd(true);
+});
+
+// タッチ：線の上を長押ししたらドラッグ開始。長押し前に指が動いたら普通の地図移動
+mapEl.addEventListener('touchstart', (e) => {
+  if (sketchActive() || lineDrag.active || e.touches.length !== 1 || !state.legs.length) { lineDragEnd(false); return; }
+  const t = e.changedTouches[0];
+  const px = map.mouseEventToContainerPoint(t);
+  if (nearMarker(px, 26)) return;
+  const n = nearestLeg(px);
+  if (n.leg < 0 || n.d > 22) return;
+  lineDrag.touchId = t.identifier; lineDrag.startPx = px;
+  const startPt = { clientX: t.clientX, clientY: t.clientY };
+  lineDrag.timer = setTimeout(() => { lineDragBegin(n.leg, startPt); toast('指を動かしてルートを変更'); }, 350);
+}, { passive: true, capture: true });
+mapEl.addEventListener('touchmove', (e) => {
+  if (lineDrag.touchId === null) return;
+  const t = [...e.changedTouches].find((x) => x.identifier === lineDrag.touchId);
+  if (!t) return;
+  if (!lineDrag.active) {
+    // 長押しが成立する前に動いた → 地図をずらしたいだけなので取り消し
+    if (map.mouseEventToContainerPoint(t).distanceTo(lineDrag.startPx) > 10 || e.touches.length > 1) lineDragEnd(false);
+    return;
+  }
+  e.preventDefault(); e.stopPropagation();
+  lineDragMove(t);
+}, { passive: false, capture: true });
+const lineTouchEnd = (e) => {
+  if (lineDrag.touchId === null) return;
+  if (![...e.changedTouches].some((x) => x.identifier === lineDrag.touchId)) return;
+  if (lineDrag.active) { e.preventDefault(); e.stopPropagation(); }
+  lineDragEnd(e.type === 'touchend');
+};
+mapEl.addEventListener('touchend', lineTouchEnd, { passive: false, capture: true });
+mapEl.addEventListener('touchcancel', lineTouchEnd, { passive: false, capture: true });
+
 // ===== ボタン =====
 $('#btn-undo').onclick = () => {
   if (!state.history.length) return;
   state.points = state.history.pop();
+  state.selected = null;
   state.legs = [];
   changed();
 };
 $('#btn-reverse').onclick = () => {
   if (state.points.length < 2) return;
-  pushHistory(); state.points.reverse(); state.legs = []; changed(); toast('出発地と目的地を入れ替えました');
+  pushHistory(); state.points.reverse(); state.legs = []; state.selected = null; changed(); toast('出発地と目的地を入れ替えました');
 };
 $('#btn-save').onclick = saveCurrent;
 $('#btn-start').onclick = openStartSheet;
@@ -483,13 +837,27 @@ $('#btn-share').onclick = shareRoute;
 $('#btn-list').onclick = () => { renderList(); showSheet('#sheet-list'); };
 $('#btn-new').onclick = () => {
   if (state.dirty && state.points.length && !confirm('編集中のルートは保存されていません。新しく作りますか？')) return;
-  Object.assign(state, { id: null, name: '', points: [], legs: [], history: [], dirty: false });
+  Object.assign(state, { id: null, name: '', points: [], legs: [], history: [], dirty: false, selected: null });
   renderAll(); saveDraft();
   toast('地図をタップして出発地を置いてください');
 };
 $('#avoid-tolls').onchange = (e) => { state.avoidTolls = e.target.checked; changed(); };
+$('#main-road').onchange = (e) => { state.mainRoad = e.target.checked; storage.set('touring.mainRoad', state.mainRoad); changed(); };
 $('#route-name').addEventListener('input', (e) => { state.name = e.target.value; state.dirty = true; saveDraft(); });
 $('#route-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });
+
+$('#btn-markers').onclick = () => {
+  markerMode = MARKER_MODES[(MARKER_MODES.indexOf(markerMode) + 1) % MARKER_MODES.length];
+  try { localStorage.setItem('touring.markerMode', markerMode); } catch { /* 無視 */ }
+  applyMarkerMode();
+  toast(MARKER_MODE_LABEL[markerMode]);
+};
+function applyMarkerMode() {
+  document.body.dataset.markers = markerMode;
+  renderMarkers();
+}
+// 拡大縮小で込み具合が変わるので、バッジを描き直す
+map.on('zoomend', () => renderMarkers());
 
 $('#btn-layer').onclick = () => {
   layerIndex = (layerIndex + 1) % LAYERS.length;
@@ -511,6 +879,8 @@ $('#btn-locate').onclick = () => {
 
 // ===== 起動 =====
 (function init() {
+  document.body.dataset.markers = markerMode;
+  state.mainRoad = storage.get('touring.mainRoad', true);
   // 共有URLから開いた場合
   const m = location.hash.match(/#r=([\w-]+)/);
   if (m) {

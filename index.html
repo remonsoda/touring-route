@@ -36,7 +36,10 @@
   <div class="map-tools">
     <button class="tool-btn" id="btn-locate" aria-label="現在地">◎</button>
     <button class="tool-btn" id="btn-layer" aria-label="地図切替">地</button>
+    <button class="tool-btn" id="btn-markers" aria-label="経由地の表示切替">経</button>
   </div>
+  <!-- なぞるボタン（押している間、もう1本の指でなぞる） -->
+  <button class="sketch-btn" id="btn-sketch" aria-label="なぞる">✎<small>なぞる</small></button>
 
   <!-- 一時メッセージ -->
   <div id="toast" class="toast" role="status"></div>
@@ -49,10 +52,16 @@
       <div><span id="stat-points">0</span><small>経由地</small></div>
       <div id="toll-badge" class="badge" hidden>有料区間あり</div>
     </div>
-    <label class="switch-row">
-      <input type="checkbox" id="avoid-tolls" checked>
-      <span>有料道路を避ける</span>
-    </label>
+    <div class="switches">
+      <label class="switch-row">
+        <input type="checkbox" id="avoid-tolls" checked>
+        <span>有料道路を避ける</span>
+      </label>
+      <label class="switch-row">
+        <input type="checkbox" id="main-road" checked>
+        <span>大通りを優先</span>
+      </label>
+    </div>
     <div class="actions">
       <button class="btn" id="btn-undo">戻す</button>
       <button class="btn" id="btn-reverse">逆順</button>
