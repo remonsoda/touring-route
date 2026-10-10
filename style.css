@@ -26,7 +26,7 @@ button, input { font: inherit; color: inherit; }
 .icon-btn { width: 44px; height: 44px; border-radius: 10px; border: none; background: var(--bg); font-size: 20px; cursor: pointer; flex: none; }
 
 /* 地図 */
-#map { flex: 1; min-height: 0; background: #20262e; }
+#map { flex: 1; min-height: 0; background: #dfe3e8; }
 .leaflet-container { font: inherit; }
 
 .map-tools { position: absolute; right: 12px; top: calc(var(--safe-top) + 76px); display: flex; flex-direction: column; gap: 8px; z-index: 500; }

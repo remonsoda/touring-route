@@ -69,6 +69,12 @@ const savedView = storage.get(STORE_VIEW, { center: [35.36, 138.73], zoom: 9 });
 const map = L.map('map', { zoomControl: false, tap: true }).setView(savedView.center, savedView.zoom);
 let layerIndex = 0;
 let baseLayer = L.tileLayer(LAYERS[0].url, { maxZoom: LAYERS[0].max, attribution: LAYERS[0].attr }).addTo(map);
+// 地図の枠の大きさが変わったら Leaflet に知らせる。
+// これがないと、下のパネルの高さが変わったときなどに地図の一部しか読み込まれない
+if ('ResizeObserver' in window) {
+  new ResizeObserver(() => map.invalidateSize({ pan: false })).observe(document.getElementById('map'));
+}
+window.addEventListener('load', () => map.invalidateSize({ pan: false }));
 map.on('moveend', () => storage.set(STORE_VIEW, { center: [map.getCenter().lat, map.getCenter().lng], zoom: map.getZoom() }));
 
 const routeGroup = L.layerGroup().addTo(map);   // ルートの線
